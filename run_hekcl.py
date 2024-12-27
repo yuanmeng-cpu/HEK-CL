@@ -8,8 +8,8 @@ from time import time
 from prettytable import PrettyTable
 import datetime
 from utils.parser import parse_args_kgcl as parse_args
-from utils.data_loader_kgcl import load_data, generate_kg_batch
-from modules.KGCL.KGCL import KGCL
+from utils.data_loader_hekcl import load_data, generate_kg_batch
+from modules.HEKCL.HEKCL import HEKCL
 from utils.evaluator import Evaluator
 from utils.helper import early_stopping, init_logger
 from logging import getLogger
@@ -79,7 +79,7 @@ if __name__ == '__main__':
         # test_cf_pairs = torch.LongTensor(np.array([[cf[0], cf[1]] for cf in test_cf], np.int32))
 
         """define model"""
-        model = KGCL(n_params, args, graph, adj_mat).to(device)
+        model = HEKCL(n_params, args, graph, adj_mat).to(device)
         model.print_shapes()
         """define optimizer"""
         rec_optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)

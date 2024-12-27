@@ -6,6 +6,7 @@ from torch_scatter import scatter_mean, scatter_sum, scatter_softmax
 from logging import getLogger
 from scipy.sparse import csr_matrix
 import scipy.sparse as sp
+import geoopt
 
 def _L2_loss_mean(x):
     return torch.mean(torch.sum(torch.pow(x, 2), dim=1, keepdim=False) / 2.)
@@ -52,14 +53,17 @@ class RGAT(nn.Module):
     def agg(self, entity_emb, relation_emb, kg):
         edge_index, edge_type = kg
         head, tail = edge_index
-        a_input = torch.cat([entity_emb[head], entity_emb[tail]], dim=-1)
-        e_input = torch.multiply(self.fc(a_input), relation_emb[edge_type]).sum(-1) # N,e
-        e = self.leakyrelu(e_input) # (N, e_num)
+
+        # 计算关系嵌入和实体嵌入的点积（在 Lorentz 流形上）
+        e_input = self.manifold.inner(entity_emb[head], relation_emb[edge_type])  # Lorentz 内积
+        e = self.leakyrelu(e_input)
         e = scatter_softmax(e, head, dim=0, dim_size=entity_emb.shape[0])
-        agg_emb = entity_emb[tail] * e.view(-1, 1)
+
+        # 消息聚合（仍在 Lorentz 流形上）
+        agg_emb = self.manifold.mobius_add(entity_emb[tail] * e.view(-1, 1), entity_emb[head])
         agg_emb = scatter_sum(agg_emb, head, dim=0, dim_size=entity_emb.shape[0])
-        agg_emb = agg_emb + entity_emb
         return agg_emb
+
     
     def forward(self, entity_emb, relation_emb, kg, mess_dropout=True):
         entity_res_emb = entity_emb
@@ -74,9 +78,9 @@ class RGAT(nn.Module):
         return entity_emb
 
 
-class KGCL(nn.Module):
+class HEKCL(nn.Module):
     def __init__(self, data_config, args_config, kg_graph, adj_mat):
-        super(KGCL, self).__init__()
+        super(HEKCL, self).__init__()
         self.n_users = data_config['n_users']
         self.n_items = data_config['n_items']
         self.n_relations = data_config['n_relations']
@@ -88,7 +92,6 @@ class KGCL(nn.Module):
         self.tau = args_config.tau
         self.cl_weight = args_config.cl_weight
         self.mu = args_config.mu
-
         self.decay = args_config.l2
         self.emb_size = args_config.dim
         self.context_hops = args_config.context_hops
@@ -96,17 +99,30 @@ class KGCL(nn.Module):
         self.node_dropout_rate = args_config.node_dropout_rate
         self.mess_dropout = args_config.mess_dropout
         self.mess_dropout_rate = args_config.mess_dropout_rate
-        self.device = torch.device("cuda:" + str(args_config.gpu_id)) if args_config.cuda \
-                                                                      else torch.device("cpu")
-        self.ui_mat = adj_mat
-        self.binorm_adj = self._make_binorm_adj(adj_mat)
-        self.edge_index, self.edge_type = self._get_edges(kg_graph)
+        self.device = torch.device("cuda:" + str(args_config.gpu_id)) if args_config.cuda else torch.device("cpu")
+        
+        # 双曲流形定义
+        self.manifold = geoopt.manifolds.Lorentz(k=-1.0)  # k 是曲率参数（负数）
 
+        # 初始化嵌入
         self.all_embed = nn.init.xavier_uniform_(torch.empty(self.n_nodes, self.emb_size))
         self.relation_embed = nn.init.xavier_uniform_(torch.empty(self.n_relations, self.emb_size))
-        self.all_embed = nn.Parameter(self.all_embed)
-        self.relation_embed = nn.Parameter(self.relation_embed)
+
+        # 将嵌入映射到 Lorentz 流形
+        self.all_embed = nn.Parameter(self.manifold.expmap0(self.all_embed), requires_grad=True)
+        self.relation_embed = nn.Parameter(self.manifold.expmap0(self.relation_embed), requires_grad=True)
+
+        # 初始化 edge_index 和 edge_type
+        assert kg_graph is not None, "kg_graph cannot be None!"
+        self.edge_index, self.edge_type = self._get_edges(kg_graph)
+
+        # 初始化邻接矩阵
+        self.ui_mat = adj_mat
+        self.binorm_adj = self._make_binorm_adj(adj_mat)
+
+        # RGAT 模块
         self.rgat = RGAT(self.emb_size, self.context_hops, self.mess_dropout_rate)
+
 
     def _make_binorm_adj(self, mat):
         a = csr_matrix((self.n_users, self.n_users))
@@ -129,10 +145,15 @@ class KGCL(nn.Module):
         return torch.sparse.FloatTensor(idxs, vals, shape).to(self.device)
 
     def _get_edges(self, graph):
-        graph_tensor = torch.tensor(list(graph.edges))  # [-1, 3]
-        index = graph_tensor[:, :-1]  # [-1, 2]
-        type = graph_tensor[:, -1]  # [-1, 1]
-        return index.t().long().to(self.device), type.long().to(self.device)
+        """
+        从知识图中提取边信息
+        """
+        assert graph is not None, "Graph is None!"
+        assert hasattr(graph, 'edges'), "Graph does not have an 'edges' attribute!"
+        graph_tensor = torch.tensor(list(graph.edges(data="type")))  # 假设每条边有 'type' 属性
+        index = graph_tensor[:, :2].t().long().to(self.device)  # 边的索引 [2, num_edges]
+        edge_type = graph_tensor[:, 2].long().to(self.device)   # 边的类型 [num_edges]
+        return index, edge_type
 
     def _convert_sp_mat_to_sp_tensor(self, X):
         coo = X.tocoo()
@@ -168,6 +189,13 @@ class KGCL(nn.Module):
 
     @torch.no_grad()
     def get_aug_views(self):
+        """
+        增强视图生成函数
+        """
+        # 确保 edge_index 和 edge_type 已初始化
+        assert hasattr(self, 'edge_index') and self.edge_index is not None, "edge_index is not initialized!"
+        assert hasattr(self, 'edge_type') and self.edge_type is not None, "edge_type is not initialized!"
+
         entity_emb = self.all_embed[self.n_users:, :]
         kg_view_1 = _edge_sampling(self.edge_index, self.edge_type, self.node_dropout_rate)
         kg_view_2 = _edge_sampling(self.edge_index, self.edge_type, self.node_dropout_rate)
@@ -177,6 +205,18 @@ class KGCL(nn.Module):
         ui_view_1 = self.get_ui_aug_views(stability, mu=self.mu)
         ui_view_2 = self.get_ui_aug_views(stability, mu=self.mu)
         return kg_view_1, kg_view_2, ui_view_1, ui_view_2
+
+    def generate(self):
+        """
+        生成用户和物品嵌入
+        """
+        # 确保 edge_index 和 edge_type 已初始化
+        assert hasattr(self, 'edge_index') and self.edge_index is not None, "edge_index is not initialized!"
+        assert hasattr(self, 'edge_type') and self.edge_type is not None, "edge_type is not initialized!"
+
+        return self.gcn(self.edge_index, self.edge_type, self.binorm_adj)
+
+    
 
     def forward(self, batch):
         user = batch['users']
@@ -215,35 +255,37 @@ class KGCL(nn.Module):
         user_emb = self.all_embed[:self.n_users, :]
         entity_emb = self.all_embed[self.n_users:, :]
 
-        entity_emb = self.rgat(entity_emb, self.relation_embed, [edge_index, edge_type], self.mess_dropout&self.training)[:self.n_items, :]
+        # 使用 RGAT 进行消息传递
+        entity_emb = self.rgat(entity_emb, self.relation_embed, [edge_index, edge_type], self.mess_dropout & self.training)[:self.n_items, :]
 
+        # 将结果拼接后进行流形上的消息传播
         res_emb = [torch.cat([user_emb, entity_emb], dim=0)]
         for l in range(self.context_hops):
             all_emb = torch.sparse.mm(g, res_emb[-1])
+            all_emb = self.manifold.expmap0(all_emb)  # 保证传播后的嵌入仍然在 Lorentz 流形上
             res_emb.append(all_emb)
         res_emb = sum(res_emb)
+
+        # 拆分用户和物品嵌入
         user_res_emb, item_res_emb = res_emb.split([self.n_users, self.n_items], dim=0)
         return user_res_emb, item_res_emb
     
-    def generate(self):
-        return self.gcn(self.edge_index, self.edge_type, self.binorm_adj)
     
     def bpr_loss(self, users_emb, pos_emb, neg_emb):
+        reg_loss = (1 / 2) * (users_emb.norm(2).pow(2) +
+                            pos_emb.norm(2).pow(2) +
+                            neg_emb.norm(2).pow(2)) / float(users_emb.shape[0])
 
-        reg_loss = (1/2)*(users_emb.norm(2).pow(2) + 
-                         pos_emb.norm(2).pow(2)  +
-                         neg_emb.norm(2).pow(2))/float(users_emb.shape[0])
-        pos_scores = torch.mul(users_emb, pos_emb)
-        pos_scores = torch.sum(pos_scores, dim=1)
-        neg_scores = torch.mul(users_emb, neg_emb)
-        neg_scores = torch.sum(neg_scores, dim=1)
-        
-        # mean or sum
+        # 使用 Lorentz 点积计算正负样本得分
+        pos_scores = self.manifold.inner(users_emb, pos_emb)
+        neg_scores = self.manifold.inner(users_emb, neg_emb)
+
         loss = torch.sum(torch.nn.functional.softplus(-(pos_scores - neg_scores)))
-        if(torch.isnan(loss).any().tolist()):
+        if torch.isnan(loss).any().tolist():
             print("nan loss")
             return None
         return loss, reg_loss
+
        
     def calc_kg_loss_transE(self, h, r, pos_t, neg_t):
         """
@@ -267,28 +309,21 @@ class KGCL(nn.Module):
         l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(neg_t_embed)
         loss = kg_loss + 1e-3 * l2_loss
         return loss
-    
     def infonce_overall(self, z1, z2, z_all):
-
         def sim(z1: torch.Tensor, z2: torch.Tensor):
-            if z1.size()[0] == z2.size()[0]:
-                return F.cosine_similarity(z1,z2)
-            else:
-                z1 = F.normalize(z1)
-                z2 = F.normalize(z2)
-                return torch.mm(z1, z2.t())
+            """
+            Lorentz 点积相似度
+            """
+            return self.manifold.inner(z1, z2)  # 使用 Lorentz 点积
 
         f = lambda x: torch.exp(x / self.tau)
-        # batch_size
         between_sim = f(sim(z1, z2))
-        # sim(batch_size, emb_dim || all_item, emb_dim) -> batch_size, all_item
         all_sim = f(sim(z1, z_all))
-        # batch_size
         positive_pairs = between_sim
-        # batch_size
         negative_pairs = torch.sum(all_sim, 1)
         loss = torch.sum(-torch.log(positive_pairs / negative_pairs))
         return loss
+
     
     def rating(self, u_g_embeddings, i_g_embeddings):
         return torch.matmul(u_g_embeddings, i_g_embeddings.t())
